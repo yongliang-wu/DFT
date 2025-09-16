@@ -25,6 +25,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import logging
 import re
+import string
 from contextlib import nullcontext
 
 import hydra
@@ -120,6 +121,8 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(self.config)
         self.device_name = get_device_name()
+        self._sa_dft_runtime_config = None
+        self._sa_dft_weight_cache = {}
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -332,6 +335,180 @@ class FSDPSFTTrainer:
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
+    def _get_sa_dft_runtime_config(self):
+        if self._sa_dft_runtime_config is not None:
+            return self._sa_dft_runtime_config
+
+        default_stopwords = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "if",
+            "then",
+            "else",
+            "for",
+            "while",
+            "in",
+            "on",
+            "at",
+            "to",
+            "from",
+            "by",
+            "of",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "with",
+            "as",
+            "that",
+            "this",
+            "these",
+            "those",
+            "it",
+            "its",
+            "do",
+            "does",
+            "did",
+            "doing",
+            "so",
+            "such",
+            "there",
+            "here",
+            "have",
+            "has",
+            "had",
+            "having",
+            "not",
+            "no",
+            "can",
+            "could",
+            "would",
+            "should",
+            "may",
+            "might",
+            "will",
+            "shall",
+            "about",
+            "into",
+            "over",
+            "under",
+            "again",
+            "further",
+            "more",
+            "most",
+            "some",
+            "any",
+            "each",
+            "few",
+            "other",
+            "own",
+            "same",
+        }
+
+        runtime_config = {
+            "enable": True,
+            "numeric_weight": 0.3,
+            "stopword_weight": 1.0,
+            "default_weight": 0.7,
+        }
+
+        sa_dft_config = getattr(self.config, "sa_dft", None)
+        if sa_dft_config is not None:
+            sa_dft_config = convert_to_regular_types(sa_dft_config)
+            if isinstance(sa_dft_config, dict):
+                runtime_config["enable"] = sa_dft_config.get("enable", runtime_config["enable"])
+                runtime_config["numeric_weight"] = float(
+                    sa_dft_config.get("numeric_weight", runtime_config["numeric_weight"])
+                )
+                runtime_config["stopword_weight"] = float(
+                    sa_dft_config.get("stopword_weight", runtime_config["stopword_weight"])
+                )
+                runtime_config["default_weight"] = float(
+                    sa_dft_config.get("default_weight", runtime_config["default_weight"])
+                )
+                additional_stopwords = sa_dft_config.get("additional_stopwords", [])
+                custom_stopwords = sa_dft_config.get("stopwords")
+            else:
+                additional_stopwords = []
+                custom_stopwords = None
+        else:
+            additional_stopwords = []
+            custom_stopwords = None
+
+        if not runtime_config["enable"]:
+            self._sa_dft_runtime_config = None
+            return self._sa_dft_runtime_config
+
+        if custom_stopwords is not None:
+            stopwords = {str(word).lower() for word in custom_stopwords}
+        else:
+            stopwords = set(default_stopwords)
+
+        stopwords.update(str(word).lower() for word in additional_stopwords)
+        runtime_config["stopwords"] = stopwords
+
+        self._sa_dft_runtime_config = runtime_config
+        return self._sa_dft_runtime_config
+
+    def _determine_sa_dft_weight(self, token: str, runtime_config):
+        if not token:
+            return runtime_config["stopword_weight"]
+
+        normalized = token.replace("Ċ", " ")
+        normalized = normalized.strip()
+        normalized = normalized.lstrip("Ġ▁")
+        normalized_lower = normalized.lower()
+
+        if any(char.isdigit() for char in normalized_lower):
+            return runtime_config["numeric_weight"]
+
+        stripped = normalized_lower.strip()
+        stripped_no_punct = stripped.strip(string.punctuation)
+
+        if not stripped_no_punct:
+            return runtime_config["stopword_weight"]
+
+        if stripped_no_punct in runtime_config["stopwords"]:
+            return runtime_config["stopword_weight"]
+
+        if stripped in runtime_config["stopwords"]:
+            return runtime_config["stopword_weight"]
+
+        return runtime_config["default_weight"]
+
+    def _compute_semantic_weights(self, token_ids: torch.Tensor, reference_tensor: torch.Tensor):
+        runtime_config = self._get_sa_dft_runtime_config()
+        if not runtime_config:
+            return torch.ones_like(reference_tensor)
+
+        if not hasattr(self, "_sa_dft_weight_cache"):
+            self._sa_dft_weight_cache = {}
+
+        flat_ids = token_ids.detach().view(-1).cpu().tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(flat_ids)
+        if not isinstance(tokens, list):
+            tokens = [tokens]
+
+        weights = []
+        for token_id, token in zip(flat_ids, tokens):
+            cached = self._sa_dft_weight_cache.get(token_id)
+            if cached is None:
+                weight = self._determine_sa_dft_weight(token, runtime_config)
+                self._sa_dft_weight_cache[token_id] = weight
+            else:
+                weight = cached
+            weights.append(weight)
+
+        weight_tensor = torch.tensor(weights, dtype=reference_tensor.dtype, device=reference_tensor.device)
+        return weight_tensor.view(reference_tensor.shape)
+
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
@@ -368,7 +545,9 @@ class FSDPSFTTrainer:
 
                 probs = torch.softmax(shift_logits, dim=-1)
                 prob_coefficients = probs.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
-                loss = loss * prob_coefficients.detach()
+                semantic_weights = self._compute_semantic_weights(shift_labels, prob_coefficients)
+                scaled_coefficients = torch.pow(prob_coefficients, semantic_weights).detach()
+                loss = loss * scaled_coefficients
                 loss = loss * loss_mask.to(loss.device)
                 original_loss = original_loss * loss_mask.to(original_loss.device)
             else:
@@ -413,8 +592,17 @@ class FSDPSFTTrainer:
                 logits_rmpad = output.logits.squeeze(0)
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
                 loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
+                original_loss = loss.clone()
+                probs = torch.softmax(logits_rmpad, dim=-1)
+                prob_coefficients = probs.gather(1, input_ids_rmpad_rolled.unsqueeze(-1)).squeeze(-1)
+                semantic_weights = self._compute_semantic_weights(input_ids_rmpad_rolled, prob_coefficients)
+                scaled_coefficients = torch.pow(prob_coefficients, semantic_weights).detach()
+                loss = loss * scaled_coefficients
                 # Gather and unpad for sequence parallelism
                 loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                original_loss = gather_outpus_and_unpad(
+                    original_loss, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                )
 
                 # This is the loss collected from all ulysses ranks
                 full_loss = pad_input(
@@ -422,8 +610,14 @@ class FSDPSFTTrainer:
                 )
                 full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
                 full_loss = full_loss.reshape(-1)
+                original_full_loss = pad_input(
+                    hidden_states=original_loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
+                )
+                original_full_loss = original_full_loss.squeeze(-1)[:, :-1]
+                original_full_loss = original_full_loss.reshape(-1)
                 loss_mask = loss_mask.to(full_loss.device)
                 loss = full_loss * loss_mask
+                original_loss = original_full_loss * loss_mask
 
             valid_token_this_rank = torch.sum(loss_mask)
 

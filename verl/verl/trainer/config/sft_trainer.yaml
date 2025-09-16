@@ -64,3 +64,9 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 8
   max_ckpt_to_keep: null # TODO
+sa_dft:
+  enable: true
+  numeric_weight: 0.3
+  stopword_weight: 1.0
+  default_weight: 0.7
+  additional_stopwords: []
