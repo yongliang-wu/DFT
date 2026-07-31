@@ -135,7 +135,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
 
 ### Step 3: Evaluation
 
-To evaluate the trained model, please first follow the [Qwen2.5-Math repository](https://github.com/QwenLM/Qwen2.5-Math) to set up the evaluation environment.
+To evaluate the trained model, please first follow the [Qwen2.5-Math repository](https://github.com/QwenLM/Qwen2.5-Math) to set up the evaluation environment. Run the commands below from the `math_evaluation` directory.
 
 ```bash
 # Select the prompt format matching your model
