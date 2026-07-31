@@ -173,7 +173,7 @@ If you find this paper valuable for your research or applications, we would appr
 ```
 
 ## Related Repositories
-* [https://github.com/huggingface/trl](https://github.com/huggingface/trl): TRL supports DFT now, check [this script](https://github.com/huggingface/trl/blob/main/docs/source/sft_trainer.md).
+* [https://github.com/huggingface/trl](https://github.com/huggingface/trl): TRL supports DFT now; see [the SFT Trainer documentation](https://github.com/huggingface/trl/blob/main/docs/source/sft_trainer.md).
 * [https://github.com/hiyouga/LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory): LLaMA-Factory supports DFT now, check [this script](https://github.com/hiyouga/LLaMA-Factory/blob/main/examples/extras/dft/qwen2_full_sft.yaml).
 * [https://github.com/modelscope/ms-swift](https://github.com/modelscope/ms-swift): ms-swift supports DFT now, check [this script](https://github.com/modelscope/ms-swift/blob/main/examples/train/full/dft.sh).
 * [https://github.com/Lauorie/DFT](https://github.com/Lauorie/DFT): Reproduced the DFT method without using Verl.
